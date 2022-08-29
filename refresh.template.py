@@ -529,7 +529,7 @@ def _get_files(compile_action):
         compile_action.arguments.insert(1, lang_flag)
 
     return {source_file}, header_files
-_get_files.has_logged_missing_file_error = False
+_get_files.has_logged_missing_file_error = True
 # Setup extensions and flags for the whole C-language family.
 # Clang has a list: https://github.com/llvm/llvm-project/blob/b9f3b7f89a4cb4cf541b7116d9389c73690f78fa/clang/lib/Driver/Types.cpp#L293
 _get_files.c_source_extensions = ('.c', '.i')
@@ -666,7 +666,19 @@ def _all_platform_patch(compile_args: typing.List[str]):
     return compile_args
 
 
-def _get_cpp_command_for_files(compile_action):
+def _apply_path_replacements(compile_args: typing.List[str], replacements: typing.Mapping[str, str]) -> typing.List[str]:
+    def replace_single(arg):
+        for (prefix, replacement) in replacements.items():
+            if arg.startswith(prefix):
+                return replacement + arg[len(prefix) :]
+            for variant in ("={}", "-I{}", "/I{}"):
+                if variant.format(prefix) in arg:
+                    return arg.replace(variant.format(prefix), variant.format(replacement))
+        return arg
+
+    return list(replace_single(arg) for arg in compile_args)
+
+def _get_cpp_command_for_files(compile_action, replacements: typing.Mapping[str, str]):
     """Reformat compile_action into a compile command clangd can understand.
 
     Undo Bazel-isms and figures out which files clangd should apply the command to.
@@ -675,13 +687,14 @@ def _get_cpp_command_for_files(compile_action):
     compile_action.arguments = _all_platform_patch(compile_action.arguments)
     compile_action.arguments = _apple_platform_patch(compile_action.arguments)
     # Android and Linux and grailbio LLVM toolchains: Fine as is; no special patching needed.
+    compile_action.arguments = _apply_path_replacements(compile_action.arguments, replacements)
 
     source_files, header_files = _get_files(compile_action)
 
     return source_files, header_files, compile_action.arguments
 
 
-def _convert_compile_commands(aquery_output):
+def _convert_compile_commands(aquery_output, replacements: typing.Mapping[str, str]):
     """Converts from Bazel's aquery format to de-Bazeled compile_commands.json entries.
 
     Input: jsonproto output from aquery, pre-filtered to (Objective-)C(++) compile actions for a given build.
@@ -709,12 +722,15 @@ def _convert_compile_commands(aquery_output):
         if {exclude_external_sources}:
             aquery_output.actions = filter(lambda action: not action.is_external, aquery_output.actions)
 
+    def worker(compile_action):
+        return _get_cpp_command_for_files(compile_action, replacements)
+
     # Process each action from Bazelisms -> file paths and their clang commands
     # Threads instead of processes because most of the execution time is farmed out to subprocesses. No need to sidestep the GIL. Might change after https://github.com/clangd/clangd/issues/123 resolved
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=min(32, (os.cpu_count() or 1) + 4) # Backport. Default in MIN_PY=3.8. See "using very large resources implicitly on many-core machines" in https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor
     ) as threadpool:
-        outputs = threadpool.map(_get_cpp_command_for_files, aquery_output.actions)
+        outputs = threadpool.map(worker, aquery_output.actions)
 
     # Yield as compile_commands.json entries
     header_files_already_written = set()
@@ -738,6 +754,19 @@ def _convert_compile_commands(aquery_output):
                 'directory': os.environ["BUILD_WORKSPACE_DIRECTORY"],
             }
 
+def _call_bazel(args: typing.Sequence[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        (
+            'bazel',
+            *args,
+            # Shush logging. Just for readability.
+            '--ui_event_filters=-info',
+            '--noshow_progress',
+        ),
+        capture_output=True,
+        encoding=locale.getpreferredencoding(),
+        check=False, # We explicitly ignore errors from `bazel aquery` and carry on.
+    )
 
 def _get_commands(target: str, flags: str):
     """Yields compile_commands.json entries for a given target and flags, gracefully tolerating errors."""
@@ -761,7 +790,6 @@ def _get_commands(target: str, flags: str):
 
     # First, query Bazel's C-family compile actions for that configured target
     aquery_args = [
-        'bazel',
         'aquery',
         # Aquery docs if you need em: https://docs.bazel.build/versions/master/aquery.html
         # Aquery output proto reference: https://github.com/bazelbuild/bazel/blob/master/src/main/protobuf/analysis_v2.proto
@@ -771,9 +799,6 @@ def _get_commands(target: str, flags: str):
         '--output=jsonproto',
         # We'll disable artifact output for efficiency, since it's large and we don't use them. Small win timewise, but dramatically less json output from aquery.
         '--include_artifacts=false',
-        # Shush logging. Just for readability.
-        '--ui_event_filters=-info',
-        '--noshow_progress',
         # Disable param files, which would obscure compile actions
         # Mostly, people enable param files on Windows to avoid the relatively short command length limit.
             # For more, see compiler_param_file in https://bazel.build/docs/windows
@@ -783,12 +808,7 @@ def _get_commands(target: str, flags: str):
         '--features=-compiler_param_file',
     ] + additional_flags
 
-    aquery_process = subprocess.run(
-        aquery_args,
-        capture_output=True,
-        encoding=locale.getpreferredencoding(),
-        check=False, # We explicitly ignore errors from `bazel aquery` and carry on.
-    )
+    aquery_process = _call_bazel(aquery_args)
 
 
     # Filter aquery error messages to just those the user should care about.
@@ -815,7 +835,13 @@ def _get_commands(target: str, flags: str):
         print(f"\033[0;33m>>> Failed extracting commands for {target}\n    Continuing gracefully...\033[0m",  file=sys.stderr)
         return
 
-    yield from _convert_compile_commands(parsed_aquery_output)
+
+    output_path = pathlib.Path(_call_bazel(("info", "output_path")).stdout.strip())
+
+    yield from _convert_compile_commands(parsed_aquery_output, {
+        "bazel-out/": os.fspath(output_path) + "/",
+        "external/": os.fspath(output_path.parent / "external") + "/",
+    })
 
 
     # Log clear completion messages
@@ -915,8 +941,8 @@ if __name__ == '__main__':
     workspace_root = pathlib.Path(os.environ['BUILD_WORKSPACE_DIRECTORY']) # Set by `bazel run`
     os.chdir(workspace_root) # Ensure the working directory is the workspace root. Assumed by future commands.
 
-    _ensure_gitignore_entries()
-    _ensure_external_workspaces_link_exists()
+    # _ensure_gitignore_entries()
+    # _ensure_external_workspaces_link_exists()
 
     target_flag_pairs = [
         # Begin: template filled by Bazel
